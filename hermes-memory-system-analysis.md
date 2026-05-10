@@ -569,3 +569,420 @@ hermes_cli/main.py                ← hermes memory 命令注册
 ---
 
 *文档生成于 Hermes Agent 仓库代码分析，覆盖 `agent/memory_provider.py`、`agent/memory_manager.py`、`tools/memory_tool.py`、`plugins/memory/__init__.py`、`run_agent.py`（相关部分）、`hermes_cli/memory_setup.py` 和所有 8 个外部 Provider 插件。*
+
+---
+
+## 四、Memory 完整保存流程分析
+
+本章深入分析 Agent 如何**决策**保存记忆，判断条件是什么，以及三条互补的触发路径如何协同工作。
+
+### 4.1 保存记忆的三大触发机制
+
+```
+保存记忆 = Agent 的"自省决策" × 3 条独立路径
+```
+
+| 触发路径 | 触发条件 | 谁决策 | 触发时机 | 对应代码 |
+|----------|----------|--------|----------|----------|
+| **① 前置引导** | 系统提示中的 MEMORY_GUIDANCE 持续告知 | Agent 自主（LLM 自行判断） | 任一回合中，Agent 认为合适时 | `prompt_builder.py:150` |
+| **② 周期性 nudge** | 每 N 轮用户消息（默认 10 轮）自动触发 | 后台 review agent 判断 | **本轮响应交付后**，后台异步执行 | `run_agent.py:11607-11617` |
+| **③ 模型自主调用** | Agent 认为有值得保存的信息 | Agent 自主 | 任意工具调用回合 | `memory_tool.py` 的 tool schema |
+
+> 注意：这三条路径**并行存在、互补**。如果 Agent 在对话中自主调用了 `memory` 工具，nudge 计数器归零，不会重复触发后台 review。
+
+---
+
+### 4.2 触发路径①：系统提示前置引导（MEMORY_GUIDANCE）
+
+#### 注入时机
+
+在每次 AI 调用前，`run_agent.py` 组装系统提示：
+
+```python
+# run_agent.py:5700-5730
+prompt_parts.append(MEMORY_GUIDANCE)       # → 行为规则
+prompt_parts.append(SESSION_SEARCH_GUIDANCE)  # → 查询规则
+
+# 注入冻结快照（已有记忆内容）
+if self._memory_enabled:
+    mem_block = self._memory_store.format_for_system_prompt("memory")
+    if mem_block:
+        prompt_parts.append(mem_block)
+if self._user_profile_enabled:
+    user_block = self._memory_store.format_for_system_prompt("user")
+    if user_block:
+        prompt_parts.append(user_block)
+```
+
+#### MEMORY_GUIDANCE 定义的完整决策规则
+
+**5 个"应该保存"的信号：**
+
+| 信号 | 原文 | 举例 |
+|------|------|------|
+| S1. 用户纠正 | "User corrects you or says 'remember this' / 'don't do that again'" | "不要用这么啰嗦的格式" |
+| S2. 用户分享偏好 | "User shares a preference, habit, or personal detail" | "我喜欢用 pytest" |
+| S3. 环境发现 | "You discover something about the environment" | "OS 是 Ubuntu 24.04" |
+| S4. 约定/API 怪癖 | "You learn a convention, API quirk, or workflow" | "这个 API 需要 X 头" |
+| S5. 稳定事实 | "You identify a stable fact that will be useful again" | "项目使用 Poetry 管理" |
+
+**4 个"不应该保存"的信号：**
+
+| 反信号 | 原因 |
+|--------|------|
+| 任务进度 | "不要保存 PR 编号、issue 编号、commit SHA、'修复了 bug X'" |
+| 临时 TODO | "使用 session_search 来回忆" |
+| 7 天内会过期的 | "如果一个事实一周后会过时，它不属于记忆" |
+| 指令式语句 | "写声明式事实，不是指令自己" → '用户偏好简洁' ✓, '要简洁' ✗ |
+
+**优先级规则：**
+```
+用户偏好/纠正 > 环境事实 > 程序性知识
+最有价值的记忆 = 防止用户将来重复纠正 agent 的事实
+```
+
+---
+
+### 4.3 触发路径②：周期性 Nudge 后台 Review
+
+这是**最精巧的机制**——Agent 不必在每轮对话中自我判断，系统自动在后台检查。
+
+#### 触发条件链
+
+```python
+# run_agent.py:11607-11617 — 每轮用户消息开始时
+_should_review_memory = False
+if (self._memory_nudge_interval > 0                         # (1) nudge 间隔 > 0（默认 10）
+    and "memory" in self.valid_tool_names                    # (2) memory 工具已启用
+    and self._memory_store):                                 # (3) MemoryStore 已初始化
+    self._turns_since_memory += 1                            # (4) 递增计数器
+    if self._turns_since_memory >= self._memory_nudge_interval:  # (5) 达到阈值
+        _should_review_memory = True
+        self._turns_since_memory = 0                         # (6) 重置计数器
+```
+
+**5 个条件必须全部满足**才会触发。
+
+#### 执行时机——响应交付后异步执行
+
+```python
+# run_agent.py:15128-15153
+# 等待本轮所有工具调用和最终响应完成后
+if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    try:
+        self._spawn_background_review(
+            messages_snapshot=list(messages),    # 传入当前对话快照
+            review_memory=_should_review_memory,
+            review_skills=_should_review_skills,
+        )
+    except Exception:
+        pass  # 后台 review 是 best-effort
+```
+
+**中断的轮次不触发**——不完整的工具链不应污染持久记忆。
+
+#### 后台 Review Agent 的完整生命周期
+
+```python
+def _spawn_background_review(self, messages_snapshot, review_memory, review_skills):
+    # (1) 选定 review prompt
+    if review_memory and review_skills:
+        prompt = _COMBINED_REVIEW_PROMPT
+    elif review_memory:
+        prompt = _MEMORY_REVIEW_PROMPT
+    else:
+        prompt = _SKILL_REVIEW_PROMPT
+
+    # (2) 在后台线程中 fork 一个完整的 AIAgent
+    def _run_review():
+        review_agent = AIAgent(
+            model=self.model,                       # 继承父 agent 的模型
+            max_iterations=16,                      # 最多 16 轮工具调用
+            quiet_mode=True,                        # 静默模式，不输出到屏幕
+            enabled_toolsets=["memory", "skills"],   # 只暴露 memory 和 skill 工具
+        )
+        # 关键：共享同一个 MemoryStore 实例
+        review_agent._memory_store = self._memory_store
+        # 关闭 review agent 自身的 nudge（防递归）
+        review_agent._memory_nudge_interval = 0
+        review_agent._skill_nudge_interval = 0
+
+        # (3) review agent 分析对话历史并行写入
+        review_agent.run_conversation(
+            user_message=prompt,                    # review prompt 作输入
+            conversation_history=messages_snapshot, # 全程对话快照
+        )
+
+        # (4) 汇总操作，输出用户可见摘要
+        actions = self._summarize_background_review_actions(
+            getattr(review_agent, "_session_messages", []),
+            messages_snapshot,
+        )
+        if actions:
+            summary = " · ".join(dict.fromkeys(actions))
+            self._safe_print(f"  💾 Self-improvement review: {summary}")
+
+    threading.Thread(target=_run_review, daemon=True).start()
+```
+
+#### Review Prompt 的决策逻辑
+
+```python
+_MEMORY_REVIEW_PROMPT = (
+    "Review the conversation above and consider saving to memory if appropriate.\n\n"
+    "Focus on:\n"
+    "1. Has the user revealed things about themselves — their persona, desires, "
+    "preferences, or personal details worth remembering?\n"
+    "2. Has the user expressed expectations about how you should behave, their work "
+    "style, or ways they want you to operate?\n\n"
+    "If something stands out, save it using the memory tool. "
+    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+)
+```
+
+#### 计数器重置时机
+
+```python
+# run_agent.py:10386-10390
+# Agent 每调用一次 memory 或 skill_manage 工具，计数器立刻归零
+if function_name == "memory":
+    self._turns_since_memory = 0
+elif function_name == "skill_manage":
+    self._iters_since_skill = 0
+```
+
+这意味着：**如果 Agent 在对话中主动保存了记忆，后台 review 就不会触发**——避免重复劳动。
+
+---
+
+### 4.4 触发路径③：模型自主调用 memory 工具
+
+最直接的路径——Agent 在对话中自行判断并调用 memory 工具。
+
+**工具 Schema 的 description 本身就是一份完整的保存指南：**
+
+```python
+# tools/memory_tool.py:517-538
+MEMORY_SCHEMA = {
+    "description": (
+        "Save durable information to persistent memory...\n\n"
+        "WHEN TO SAVE:\n"
+        "- User corrects you or says 'remember this' / 'don't do that again'\n"
+        "- User shares a preference, habit, or personal detail\n"
+        "- You discover something about the environment\n"
+        "- You learn a convention, API quirk, or workflow\n"
+        "- You identify a stable fact that will be useful again in future sessions\n\n"
+        "Do NOT save task progress, session outcomes, completed-work logs...\n"
+        "If you've discovered a reusable approach, save it as a **skill** instead.\n\n"
+        "TWO TARGETS:\n"
+        "- 'user': who the user is — name, role, preferences, communication style\n"
+        "- 'memory': your notes — environment facts, project conventions, tool quirks\n\n"
+        "ACTIONS: add (new entry), replace (update existing), remove (delete)\n\n"
+        "Write memories as declarative facts, not instructions to yourself."
+    ),
+}
+```
+
+---
+
+### 4.5 三种触发路径的完整关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        完整记忆保存流程图                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  会话开始                                                                │
+│     │                                                                    │
+│     ▼                                                                    │
+│  ┌──────────────────┐                                                    │
+│  │ 系统提示注入       │  ← MEMORY_GUIDANCE（前置指导）                    │
+│  │  + 已有记忆快照    │  ← 冻结快照（format_for_system_prompt）           │
+│  └────────┬─────────┘                                                    │
+│           │                                                              │
+│   ┌───────▼───────┐                                                      │
+│   │ 用户发送消息    │                                                     │
+│   └───────┬───────┘                                                     │
+│           │                                                              │
+│   ┌───────▼─────────┐                                                    │
+│   │ 判断 nudge 触发   │ ◄── _turns_since_memory ≥ nudge_interval(默认10) │
+│   └───────┬─────────┘                                                    │
+│           │                                                              │
+│   ┌───────▼──────────┐                                                   │
+│   │ Agent 处理用户请求 │                                                  │
+│   └───────┬──────────┘                                                   │
+│           │                                                              │
+│           │   ┌─────────────────────────────┐                            │
+│           │   │ Agent 自主调用了 memory ？    │                           │
+│           │   └─────────────────────────────┘                            │
+│           │                              │                               │
+│           │  ┌───────────────────┐        │  ┌──────────────┐            │
+│           │  │ 写入 MemoryStore   │        │  │ 继续正常对话  │            │
+│           │  │ 计数器归零         │        │  └──────┬───────┘            │
+│           │  │ 通知外部 Provider   │        │         │                   │
+│           │  └───────────────────┘        │         │                   │
+│           │                              │         │                   │
+│           └──────┬───────────────────────┘         │                     │
+│                  │                                 │                     │
+│                  ▼                                 ▼                     │
+│          ┌───────────────────┐        ┌────────────────────┐             │
+│          │ 本轮响应已交付用户   │        │ 本轮响应已交付用户   │             │
+│          └─────────┬─────────┘        └────────┬───────────┘             │
+│                    │                           │                         │
+│                    ▼                           ▼                         │
+│                    ┌──────────────────────┐                              │
+│                    │ 本轮是否被中断？       │                              │
+│                    └──────┬───────────────┘                              │
+│                           │                                              │
+│                ┌──────────▼──────────┐                                   │
+│                │                     │                                   │
+│          ┌─────▼─────┐     ┌────────▼────────┐                           │
+│          │ 跳过不保存  │     │ nudge 标志为真？  │                          │
+│          └───────────┘     └────────┬────────┘                           │
+│                                     │                                    │
+│                          ┌──────────▼──────────┐                        │
+│                          │ 后台 review agent     │ ← fork AIAgent       │
+│                          │ 分析对话历史          │    16 轮上限          │
+│                          │ 调用 memory 工具      │ ← 若发现值得保存      │
+│                          │ 写入共享 MemoryStore   │                       │
+│                          └─────────────────────┘                        │
+│                                                                          │
+│  ┌──────────────────────────────────────┐                               │
+│  │ 每次写入后的统一流程                     │                              │
+│  │ 1. MemoryStore.add() / replace()      │                              │
+│  │    → 安全检查（注入/泄露检测）          │                              │
+│  │    → 文件锁下重读磁盘（防跨会话冲突）     │                              │
+│  │    → 字符预算检查                      │                              │
+│  │    → 原子写入（临时文件 + fsync + 重命名）│                             │
+│  │ 2. Bridge: MemoryManager.on_memory_write()                          │
+│  │    → 通知外部 Provider 同步写入          │                             │
+│  └──────────────────────────────────────┘                               │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4.6 保存时的内部执行流程
+
+当 Agent 调用 `memory(action="add", target="memory", content="...")` 时：
+
+```python
+# tools/memory_tool.py:224-267
+def add(self, target: str, content: str) -> Dict[str, Any]:
+    content = content.strip()
+    if not content:
+        return {"success": False, "error": "Content cannot be empty."}
+
+    # 1️⃣ 安全检查：注入/泄露检测
+    scan_error = _scan_memory_content(content)
+    if scan_error:
+        return {"success": False, "error": scan_error}
+
+    # 2️⃣ 文件锁（防多进程并发写入）
+    with self._file_lock(self._path_for(target)):
+        # 3️⃣ 重读磁盘最新状态
+        self._reload_target(target)
+        entries = self._entries_for(target)
+
+        # 4️⃣ 去重检查
+        if content in entries:
+            return {"success": True, "message": "Entry already exists."}
+
+        # 5️⃣ 字符预算检查
+        limit = self._char_limit(target)  # memory=2200, user=1375
+        new_total = len(ENTRY_DELIMITER.join(entries + [content]))
+        if new_total > limit:
+            return {"success": False, "error": f"Memory at {current}/{limit} chars..."}
+
+        # 6️⃣ 追加并持久化
+        entries.append(content)
+        self._set_entries(target, entries)
+        self.save_to_disk(target)  # 原子写入
+```
+
+**保存后**，在工具调用分发器中：
+
+```python
+# run_agent.py:10290-10314
+if function_name == "memory":
+    result = memory_tool(action, target, content, store=self._memory_store)
+
+    # 🔄 桥接：通知外部 Provider
+    if self._memory_manager and action in ("add", "replace"):
+        self._memory_manager.on_memory_write(
+            action, target, content,
+            metadata=self._build_memory_write_metadata(
+                task_id=..., tool_call_id=...,
+            ),
+        )
+```
+
+---
+
+### 4.7 Skill 保存 vs Memory 保存的边界
+
+| 维度 | 记忆 (memory) | 技能 (skill) |
+|------|--------------|-------------|
+| **保存目标** | `~/.hermes/memories/MEMORY.md` / `USER.md` | `~/.hermes/skills/<category>/<name>/SKILL.md` |
+| **保存内容** | 用户是谁、环境事实、工具怪癖 | 怎么做某类任务：步骤、陷阱、模板 |
+| **格式要求** | 简短声明式事实（"用户喜欢 pytest"） | 完整 SKILL.md 含 frontmatter + markdown |
+| **触发条件** | 用户的偏好/纠正、值得跨会话保存的事实 | 复杂任务完成（5+ 工具调用）、用户纠正 workflow、发现新流程 |
+| **生命周期** | 由模型自行决定更新/删除 | Agent 自动创建，Curator 自动维护（闲置→归档） |
+| **注入方式** | 冻结快照注入系统提示（整个会话不变） | `/skill` 命令或 `-s` 标志加载 |
+
+**关键决策规则**（来自 `run_agent.py:3943-3948`）：
+
+> "User-preference embedding: when the user expressed a style/format/workflow preference, the update belongs in the SKILL.md body, not just in memory. Memory captures 'who the user is'; skills capture 'how to do this class of task for this user'."
+
+---
+
+### 4.8 Nudge 参数配置
+
+```yaml
+memory:
+  memory_enabled: true       # 启用 MEMORY.md
+  user_profile_enabled: true # 启用 USER.md
+  memory_char_limit: 2200    # MEMORY.md 字符上限
+  user_char_limit: 1375      # USER.md 字符上限
+  nudge_interval: 10         # ⚡ 关键：每多少轮触发一次 memory review
+
+skills:
+  creation_nudge_interval: 10  # 每多少轮工具调用触发一次 skill review
+```
+
+设置 `nudge_interval: 0` 或 `creation_nudge_interval: 0` 可**完全禁用**对应的后台 review。
+
+---
+
+### 4.9 验证：计数器命中流程源码级确认
+
+```python
+# run_agent.py:11611 — 每轮开始时递增 nudge 计数器
+if (self._memory_nudge_interval > 0              # 默认 10
+    and "memory" in self.valid_tool_names        # memory 工具已注册
+    and self._memory_store):                      # MemoryStore 已初始化
+    self._turns_since_memory += 1                 # +1
+    if self._turns_since_memory >= self._memory_nudge_interval:  # 10 轮到了
+        _should_review_memory = True
+        self._turns_since_memory = 0              # 重置
+```
+
+```python
+# run_agent.py:15128-15153 — 本轮完全结束后
+if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    self._spawn_background_review(messages_snapshot, review_memory, review_skills)
+```
+
+### 4.10 总结
+
+Hermes Agent 的 memory 保存不是单一路径的 "if-then" 判断，而是 **3 层互补的决策网络**：
+
+```
+1. 前置引导层 （静态） → 系统提示持续教育 LLM 何时保存
+                               ↓
+2. 主动触发层 （动态） → Agent 在对话中自行判断并调用 memory 工具
+                               ↓
+3. 后台兜底层 （周期性）→ 每 N 轮自动 fork review agent 检查遗漏
+```
+
+其中后台 review 是**最具特色的设计**——即使 Agent 忙于处理用户请求而"忘记"保存重要信息，系统也会在后台替它完成记忆管理，并输出 `💾 Self-improvement review: ...` 摘要通知用户。
